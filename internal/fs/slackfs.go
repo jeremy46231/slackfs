@@ -131,6 +131,12 @@ type AppendFile struct {
 var _ = (fs.NodeOpener)((*AppendFile)(nil))
 var _ = (fs.NodeReader)((*AppendFile)(nil))
 var _ = (fs.NodeWriter)((*AppendFile)(nil))
+var _ = (fs.NodeSetattrer)((*AppendFile)(nil))
+
+// appendFH tracks per-open flags like O_APPEND
+type appendFH struct {
+	append bool
+}
 
 func (f *AppendFile) OnAdd(ctx context.Context) {}
 
@@ -158,7 +164,10 @@ func (f *AppendFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 			f.mu.Unlock()
 		}
 	}
-	return nil, fuse.FOPEN_KEEP_CACHE, 0
+	fh := &appendFH{append: flags&syscall.O_APPEND != 0}
+	// Use DIRECT_IO to avoid kernel page cache duplicating content for
+	// append semantics when multiple processes read/write.
+	return fh, fuse.FOPEN_DIRECT_IO, 0
 }
 
 func (f *AppendFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -182,26 +191,53 @@ func (f *AppendFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, o
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// For append files, always append to end regardless of offset
-	// This matches the behavior of O_APPEND in regular filesystems
-	oldLen := int64(len(f.data))
-	f.data = append(f.data, data...)
-	newLen := int64(len(f.data))
+	// Honor O_APPEND if set on this handle
+	if h, ok := fh.(*appendFH); ok && h.append {
+		off = int64(len(f.data))
+	}
 
-	// Get the inode from the tree for proper notification
-	// We need to be careful here - use the embedded inode correctly
+	// Ensure capacity up to off
+	if off < 0 {
+		return 0, syscall.EINVAL
+	}
+	curLen := int64(len(f.data))
+	end := off + int64(len(data))
+	if end > curLen {
+		// grow slice to new size, padding with zeros if there is a hole
+		padding := make([]byte, end-curLen)
+		f.data = append(f.data, padding...)
+	}
+	copy(f.data[off:end], data)
+
+	// Notify kernel about the modified region
 	inode := &f.Inode
-
-	// Notify kernel asynchronously so we don't block the FUSE request
+	sz := int64(len(data))
 	go func(off, sz int64) {
-		// Notify about the content change - off is where new content starts, sz is how much was added
 		if errno := inode.NotifyContent(off, sz); errno != 0 {
-			// Log errors but don't fail the write operation
 			fmt.Printf("NotifyContent failed: %v\n", errno)
 		}
-	}(oldLen, newLen-oldLen)
+	}(off, sz)
 
 	return uint32(len(data)), 0
+}
+
+func (f *AppendFile) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	// Support truncate via size change
+	if sz, ok := in.GetSize(); ok {
+		f.mu.Lock()
+		cur := uint64(len(f.data))
+		if sz < cur {
+			f.data = f.data[:sz]
+		} else if sz > cur {
+			f.data = append(f.data, make([]byte, sz-cur)...)
+		}
+		f.mu.Unlock()
+
+		out.Mode = uint32(syscall.S_IFREG | 0666)
+		out.Size = uint64(len(f.data))
+		return 0
+	}
+	return 0
 }
 
 // StreamFile auto-appends a line every 2s. It's read-only from userspace.
