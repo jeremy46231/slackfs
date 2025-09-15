@@ -13,6 +13,7 @@ import (
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	ifs "github.com/jeremy46231/slackfs/internal/fs"
+	sl "github.com/jeremy46231/slackfs/internal/slack"
 )
 
 func forceUnmount(mountPoint string) {
@@ -47,13 +48,28 @@ func main() {
 		log.Fatalf("cannot create mountpoint: %v", err)
 	}
 
+	// Construct Slack client if token present
+	var client *sl.Client
+	if tok := os.Getenv("SLACK_TOKEN"); tok != "" {
+		client = sl.NewClient(tok)
+	} else {
+		log.Printf("SLACK_TOKEN not set; channels/ will be a placeholder")
+	}
+
 	// Create root and mount with proper options
-	root := ifs.NewRoot()
+	root := ifs.NewRoot(client)
+	// Short timeouts help attributes (like file size) refresh quickly after writes.
+	attrTO := 750 * time.Millisecond
+	entryTO := 750 * time.Millisecond
+	negTO := 750 * time.Millisecond
 	opts := &fusefs.Options{
 		MountOptions: fuse.MountOptions{
 			AllowOther: false, // Only allow mounting user to access
 			Debug:      false, // Set to true for debugging
 		},
+		AttrTimeout:     &attrTO,
+		EntryTimeout:    &entryTO,
+		NegativeTimeout: &negTO,
 	}
 	server, err := fusefs.Mount(*mountPoint, root, opts)
 	if err != nil {

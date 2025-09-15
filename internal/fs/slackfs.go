@@ -9,10 +9,18 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	sl "github.com/jeremy46231/slackfs/internal/slack"
 )
 
 // Minimal in-repo filesystem for testing: exposes a root directory
-// with a single regular file `test.txt` whose content is "hello world\n".
+// with three files:
+// - test.txt    (read-only)    → returns "hello world\n"
+// - append.txt  (read/write)   → in-memory buffer; supports random writes; open with O_APPEND to force append-at-end
+// - stream.txt  (read-only)    → background appends a line every 2s
+//
+// Note: append-only behavior for append.txt is not enforced. To make it strictly
+// append-only, reject writes unless the file handle was opened with O_APPEND
+// (but this doesn't seem to work on macOS, so I don't enforce it rn)
 
 type SlackFS struct {
 	// future: Slack client reference
@@ -24,18 +32,50 @@ var _ = (fs.InodeEmbedder)((*RootDir)(nil))
 // RootDir is the root inode. Embed fs.Inode for convenience when creating children.
 type RootDir struct {
 	fs.Inode
+	nextIno uint64
+	client  *sl.Client
 }
 
-func NewRoot() *RootDir {
+func NewRoot(client *sl.Client) *RootDir {
 	// Create root with proper stable attributes
-	root := &RootDir{}
+	root := &RootDir{nextIno: 2, client: client} // reserve 1 for root
 	// The embedded fs.Inode will be properly initialized by the mount process
 	return root
 }
 
 // OnAdd is called when the inode is attached to the tree.
 func (r *RootDir) OnAdd(ctx context.Context) {
-	// no-op
+	alloc := func() uint64 {
+		if r.nextIno < 2 {
+			r.nextIno = 2
+		}
+		ino := r.nextIno
+		r.nextIno++
+		return ino
+	}
+
+	// channels/ directory (dynamic)
+	channels := NewChannelsDir(r.client)
+	chInode := r.NewPersistentInode(ctx, channels, fs.StableAttr{Mode: uint32(fuse.S_IFDIR), Ino: alloc()})
+	r.AddChild("channels", chInode, true)
+
+	// test/ directory: move demo files here
+	testDir := &Directory{}
+	testIn := r.NewPersistentInode(ctx, testDir, fs.StableAttr{Mode: uint32(fuse.S_IFDIR), Ino: alloc()})
+	r.AddChild("test", testIn, true)
+
+	// Populate test directory contents
+	hello := &HelloFile{}
+	helloIn := testDir.NewPersistentInode(ctx, hello, fs.StableAttr{Mode: uint32(fuse.S_IFREG), Ino: alloc()})
+	testDir.AddChild("test.txt", helloIn, true)
+
+	appendNode := &AppendFile{}
+	appendIn := testDir.NewPersistentInode(ctx, appendNode, fs.StableAttr{Mode: uint32(fuse.S_IFREG), Ino: alloc()})
+	testDir.AddChild("append.txt", appendIn, true)
+
+	stream := &StreamFile{}
+	streamIn := testDir.NewPersistentInode(ctx, stream, fs.StableAttr{Mode: uint32(fuse.S_IFREG), Ino: alloc()})
+	testDir.AddChild("stream.txt", streamIn, true)
 }
 
 // Getattr sets directory attributes.
@@ -50,32 +90,31 @@ func (r *RootDir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrO
 
 // Lookup finds a child by name. We support a single file `test.txt`.
 func (r *RootDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	switch name {
-	case "test.txt":
-		node := &HelloFile{}
-		out.Mode = syscall.S_IFREG | 0444
-		return r.NewInode(ctx, node, fs.StableAttr{Mode: uint32(fuse.S_IFREG), Ino: 2}), 0
-	case "append.txt":
-		node := &AppendFile{}
-		out.Mode = syscall.S_IFREG | 0666
-		return r.NewInode(ctx, node, fs.StableAttr{Mode: uint32(fuse.S_IFREG), Ino: 3}), 0
-	case "stream.txt":
-		node := &StreamFile{}
-		out.Mode = syscall.S_IFREG | 0444
-		return r.NewInode(ctx, node, fs.StableAttr{Mode: uint32(fuse.S_IFREG), Ino: 4}), 0
-	default:
+	ch := r.GetChild(name)
+	if ch == nil {
 		return nil, syscall.ENOENT
 	}
+	// Mode will be returned by child Getattr; set a sensible default
+	if ch.IsDir() {
+		out.Mode = syscall.S_IFDIR | 0755
+	} else {
+		out.Mode = syscall.S_IFREG | 0644
+	}
+	return ch, 0
 }
 
 // Readdir lists directory entries with proper file types and offsets.
-func (r *RootDir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	entries := []fuse.DirEntry{
-		{Name: "test.txt", Mode: fuse.S_IFREG, Ino: 2},
-		{Name: "append.txt", Mode: fuse.S_IFREG, Ino: 3},
-		{Name: "stream.txt", Mode: fuse.S_IFREG, Ino: 4},
-	}
-	return fs.NewListDirStream(entries), 0
+
+// Statfs provides basic filesystem stats to satisfy macOS expectations and tools like df.
+var _ = (fs.NodeStatfser)((*RootDir)(nil))
+
+func (r *RootDir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	out.Blocks = 0
+	out.Bsize = 4096
+	out.NameLen = 255
+	out.Files = 0
+	out.Ffree = 0
+	return 0
 }
 
 // HelloFile is a regular file node returning "hello world\n".
@@ -101,7 +140,6 @@ func (f *HelloFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Att
 	data := []byte("hello world\n")
 	out.Mode = uint32(syscall.S_IFREG | 0444)
 	out.Size = uint64(len(data))
-	out.Ino = 2 // stable inode number
 	now := time.Now()
 	out.SetTimes(nil, &now, &now)
 	out.Owner = fuse.Owner{Uid: uint32(syscall.Getuid()), Gid: uint32(syscall.Getgid())}
@@ -146,7 +184,6 @@ func (f *AppendFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 	f.mu.Unlock()
 	out.Mode = uint32(syscall.S_IFREG | 0666)
 	out.Size = sz
-	out.Ino = 3 // stable inode number
 	now := time.Now()
 	out.SetTimes(nil, &now, &now)
 	out.Owner = fuse.Owner{Uid: uint32(syscall.Getuid()), Gid: uint32(syscall.Getgid())}
@@ -165,8 +202,7 @@ func (f *AppendFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 		}
 	}
 	fh := &appendFH{append: flags&syscall.O_APPEND != 0}
-	// Use DIRECT_IO to avoid kernel page cache duplicating content for
-	// append semantics when multiple processes read/write.
+	// Use DIRECT_IO to avoid kernel page cache duplicating content for writes.
 	return fh, fuse.FOPEN_DIRECT_IO, 0
 }
 
@@ -216,6 +252,8 @@ func (f *AppendFile) Write(ctx context.Context, fh fs.FileHandle, data []byte, o
 		if errno := inode.NotifyContent(off, sz); errno != 0 {
 			fmt.Printf("NotifyContent failed: %v\n", errno)
 		}
+		// There is no explicit InvalidateAttr API; rely on attr timeouts from mount options
+		// and the next Getattr call to refresh size. NotifyContent helps flush page cache.
 	}(off, sz)
 
 	return uint32(len(data)), 0
@@ -245,10 +283,13 @@ type StreamFile struct {
 	fs.Inode
 	mu   sync.Mutex
 	data []byte
+	// track active readers to avoid NotifyContent spam when nobody is watching
+	readers int
 }
 
 var _ = (fs.NodeOpener)((*StreamFile)(nil))
 var _ = (fs.NodeReader)((*StreamFile)(nil))
+var _ = (fs.NodeReleaser)((*StreamFile)(nil))
 
 func (s *StreamFile) OnAdd(ctx context.Context) {
 	// start background appender that stops when ctx is done
@@ -266,9 +307,14 @@ func (s *StreamFile) OnAdd(ctx context.Context) {
 				s.data = append(s.data, []byte(line)...)
 				added := int64(len(line))
 				s.mu.Unlock()
-				// notify kernel about content change
-				if errno := s.Inode.NotifyContent(off, added); errno != 0 {
-					fmt.Printf("StreamFile NotifyContent failed: %v\n", errno)
+				// notify kernel about content change only if there are active readers
+				s.mu.Lock()
+				readers := s.readers
+				s.mu.Unlock()
+				if readers > 0 {
+					if errno := s.Inode.NotifyContent(off, added); errno != 0 {
+						fmt.Printf("StreamFile NotifyContent failed: %v\n", errno)
+					}
 				}
 			}
 		}
@@ -281,7 +327,6 @@ func (s *StreamFile) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.At
 	s.mu.Unlock()
 	out.Mode = uint32(syscall.S_IFREG | 0444)
 	out.Size = sz
-	out.Ino = 4 // stable inode number
 	now := time.Now()
 	out.SetTimes(nil, &now, &now)
 	out.Owner = fuse.Owner{Uid: uint32(syscall.Getuid()), Gid: uint32(syscall.Getgid())}
@@ -293,7 +338,12 @@ func (s *StreamFile) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 	if flags&syscall.O_WRONLY != 0 || flags&syscall.O_RDWR != 0 {
 		return nil, 0, syscall.EACCES
 	}
-	return nil, fuse.FOPEN_KEEP_CACHE, 0
+	// Count a reader for this open
+	s.mu.Lock()
+	s.readers++
+	s.mu.Unlock()
+	// Stream changes frequently; prefer DIRECT_IO for fresh reads.
+	return nil, fuse.FOPEN_DIRECT_IO, 0
 }
 
 func (s *StreamFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -311,4 +361,13 @@ func (s *StreamFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, of
 		end = len(data)
 	}
 	return fuse.ReadResultData(data[off:end]), 0
+}
+
+func (s *StreamFile) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	s.mu.Lock()
+	if s.readers > 0 {
+		s.readers--
+	}
+	s.mu.Unlock()
+	return 0
 }

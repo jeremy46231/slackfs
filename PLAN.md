@@ -71,8 +71,8 @@ Implementation Plan
 Language & Libraries
 
 - Go chosen for developer speed, good concurrency model, and cross-platform compilation.
-- FUSE: bazil.org/fuse for FUSE filesystem implementation.
-- Slack API: slack-go/slack for Slack client integration.
+- FUSE: github.com/hanwen/go-fuse/v2
+- Slack API: slack-go/slack
 
 Authentication
 
@@ -92,7 +92,7 @@ Filesystem Design
 Message Handling
 
 - Outgoing: implement Write in FUSE handler. On echo >> file, parse input line(s), send to Slack API.
-- Incoming: use Slack Socket Mode to subscribe to new messages. On new message, append to in-memory buffer and notify kernel via FUSE invalidate APIs so tail -f readers see the update.
+- Incoming: use Slack Socket Mode to subscribe to new messages. On new message, append to in-memory buffer and notify readers using go-fuse notifications (NotifyContent for data changes) and, when sizes change, attribute invalidation or short attr timeouts so tail -f readers see updates promptly.
 - Maintain rate limiting and backoff according to Slack API rules.
 
 Native Installation
